@@ -31,6 +31,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -55,6 +56,9 @@ var flDepth = flag.Int("depth", envInt("GIT_SYNC_DEPTH", 0),
 	"use a shallow clone with a history truncated to the specified number of commits")
 var flSubmodules = flag.String("submodules", envString("GIT_SYNC_SUBMODULES", "recursive"),
 	"git submodule behavior: one of 'recursive', 'shallow', or 'off'")
+var flSubmodulesRemoteTracking = flag.String("submodules-remote-tracking",
+	envString("GIT_SYNC_SUBMODULES_REMOTE_TRACKING", ""),
+	"Configure submodules list for remote tracking.")
 
 var flRoot = flag.String("root", envString("GIT_SYNC_ROOT", envString("HOME", "")+"/git"),
 	"the root directory for git-sync operations, under which --dest will be created")
@@ -629,15 +633,7 @@ func addWorktreeAndSwap(ctx context.Context, gitRoot, dest, branch, rev string, 
 	// Update submodules
 	// NOTE: this works for repo with or without submodules.
 	if submoduleMode != submodulesOff {
-		log.V(0).Info("updating submodules")
-		submodulesArgs := []string{"submodule", "update", "--init"}
-		if submoduleMode == submodulesRecursive {
-			submodulesArgs = append(submodulesArgs, "--recursive")
-		}
-		if depth != 0 {
-			submodulesArgs = append(submodulesArgs, "--depth", strconv.Itoa(depth))
-		}
-		_, err = runCommand(ctx, worktreePath, *flGitCmd, submodulesArgs...)
+		err = updateSubmodules(ctx, worktreePath, depth, submoduleMode)
 		if err != nil {
 			return err
 		}
@@ -671,6 +667,208 @@ func addWorktreeAndSwap(ctx context.Context, gitRoot, dest, branch, rev string, 
 	}
 
 	return nil
+}
+
+func updateSubmodules(ctx context.Context, worktreePath string, depth int, submoduleMode string) error {
+	log.V(0).Info("updating submodules")
+
+	updateArgs := submoduleUpdateArgs(depth, submoduleMode)
+	submodulesArgs := append([]string{"submodule", "update", "--init"}, updateArgs...)
+	_, err := runCommand(ctx, worktreePath, *flGitCmd, submodulesArgs...)
+	if err != nil {
+		return err
+	}
+
+	// Update submodules with remote tracking enabled
+	if *flSubmodulesRemoteTracking != "" {
+		return updateSubmodulesWithRemoteTracking(ctx, worktreePath, updateArgs)
+	}
+
+	return nil
+}
+
+func updateSubmodulesWithRemoteTracking(ctx context.Context, worktreePath string, updateArgs []string) error {
+	submodulePaths, err := getSubmoduleWithRemoteTrackingPaths(ctx, worktreePath)
+	if err != nil {
+		return err
+	}
+
+	for _, submodulePath := range submodulePaths {
+		uptodate, err := submoduleIsUpToDate(ctx, worktreePath, submodulePath)
+		if err != nil {
+			return err
+		}
+
+		submoduleName, err := submoduleNameFromPath(ctx, worktreePath, submodulePath)
+		if err != nil {
+			return err
+		}
+
+		if uptodate {
+			log.V(1).Info("submodule is up to date", "submoduleName", submoduleName, "submodulePath", submodulePath)
+			continue
+		}
+
+		log.V(0).Info("updating submodule with remote tracking", "submoduleName", submoduleName, "submodulePath", submodulePath)
+		submoduleRemoteUpdateArgs := append([]string{"submodule", "update", "--remote"}, updateArgs...)
+		submoduleRemoteUpdateArgs = append(submoduleRemoteUpdateArgs, submodulePath)
+		_, err = runCommand(ctx, worktreePath, *flGitCmd, submoduleRemoteUpdateArgs...)
+		if err != nil {
+			return err
+		}
+
+		updatedLocalHash, err := submoduleLocalHashForRev(ctx, worktreePath, submodulePath, "HEAD")
+		if err != nil {
+			return err
+		}
+
+		log.V(0).Info("submodule with remote tracking is updated", "submoduleName", submoduleName, "submodulePath", submodulePath, "hash", updatedLocalHash)
+	}
+
+	return nil
+}
+
+func submoduleUpdateArgs(depth int, submoduleMode string) []string {
+	args := []string{}
+	if submoduleMode == submodulesRecursive {
+		args = append(args, "--recursive")
+	}
+	if depth != 0 {
+		args = append(args, "--depth", strconv.Itoa(depth))
+	}
+
+	return args
+}
+
+func submoduleIsUpToDate(ctx context.Context, worktreePath, submodulePath string) (bool, error) {
+	localHash, err := submoduleLocalHashForRev(ctx, worktreePath, submodulePath, "HEAD")
+	if err != nil {
+		return false, err
+	}
+
+	submoduleName, err := submoduleNameFromPath(ctx, worktreePath, submodulePath)
+	if err != nil {
+		return false, nil
+	}
+
+	branchRef, err := submoduleBranchRef(ctx, worktreePath, submoduleName)
+	if err != nil {
+		return false, err
+	}
+
+	remoteHash, err := submoduleRemoteHashForRef(ctx, worktreePath, submodulePath, branchRef)
+	if err != nil {
+		return false, err
+	}
+
+	log.V(5).Info("submodule", "submoduleName", submoduleName, "localHash", localHash, "remoteHash", remoteHash, "ref", branchRef)
+	if localHash == remoteHash {
+		return true, nil
+	}
+
+	return false, nil
+}
+
+func submoduleLocalHashForRev(ctx context.Context, worktreePath, submodulePath, rev string) (string, error) {
+	submoduleWorktreePath := filepath.Join(worktreePath, submodulePath)
+	output, err := runCommand(ctx, submoduleWorktreePath, *flGitCmd, "rev-parse", rev)
+	if err != nil {
+		return "", err
+	}
+
+	localHash := strings.Trim(string(output), "\n")
+	return localHash, nil
+}
+
+func submoduleRemoteHashForRef(ctx context.Context, worktreePath, submodulePath, ref string) (string, error) {
+	submoduleWorktreePath := filepath.Join(worktreePath, submodulePath)
+	output, err := runCommand(ctx, submoduleWorktreePath, *flGitCmd, "ls-remote", "--quiet", "origin", ref)
+	if err != nil {
+		return "", err
+	}
+
+	parts := strings.Split(string(output), "\t")
+	remoteHash := parts[0]
+
+	return remoteHash, nil
+}
+
+func submoduleNameFromPath(ctx context.Context, worktreePath, submodulePath string) (string, error) {
+	submoduleNameArgs := []string{"config", "--file", ".gitmodules", "--get-regexp", ".path$"}
+	output, err := runCommand(ctx, worktreePath, *flGitCmd, submoduleNameArgs...)
+	if err != nil {
+		return "", err
+	}
+
+	splitFn := func(c rune) bool {
+		return c == '\n'
+	}
+
+	configPaths := strings.FieldsFunc(string(output), splitFn)
+	for _, configPath := range configPaths {
+		log.V(5).Info("looking up submodule name", "configPath", configPath, "submodulePath", submodulePath)
+		parts := strings.Split(configPath, " ")
+		if len(parts) == 2 && parts[1] == submodulePath {
+			re := regexp.MustCompile(`submodule\.(?P<name>.*)\.path`)
+			res := re.FindStringSubmatch(parts[0])
+
+			for i, key := range re.SubexpNames() {
+				if key == "name" {
+					log.V(5).Info("found submodule", "submoduleName", res[i])
+					return res[i], nil
+				}
+			}
+		}
+	}
+
+	return "", nil
+}
+
+func submoduleBranchRef(ctx context.Context, worktreePath, submoduleName string) (string, error) {
+	confGitModulesArgs := []string{"config", "--file", ".gitmodules", "--get"}
+	confGitModulesArgs = append(confGitModulesArgs, "submodule."+submoduleName+".branch")
+	output, err := runCommand(ctx, worktreePath, *flGitCmd, confGitModulesArgs...)
+	if err != nil {
+		return "", err
+	}
+
+	branch := strings.Trim(string(output), "\n")
+	if branch != "" {
+		return "refs/heads/" + branch, nil
+	}
+
+	return "HEAD", nil
+}
+
+func getSubmoduleWithRemoteTrackingPaths(ctx context.Context, worktreePath string) ([]string, error) {
+	output, err := runCommand(ctx, worktreePath, *flGitCmd, "submodule", "--quiet", "foreach", "pwd")
+	if err != nil {
+		return []string{}, err
+	}
+
+	splitFn := func(c rune) bool {
+		return c == '\n' || c == ','
+	}
+
+	trimWorktreePath := strings.ReplaceAll(output, worktreePath+"/", "")
+	submodulePaths := strings.FieldsFunc(trimWorktreePath, splitFn)
+	submoduleRemoteTrackingNames := strings.FieldsFunc(*flSubmodulesRemoteTracking, splitFn)
+
+	list := []string{}
+	for _, submodulePath := range submodulePaths {
+		for _, submoduleRemoteTrackingName := range submoduleRemoteTrackingNames {
+			submoduleName, err := submoduleNameFromPath(ctx, worktreePath, submodulePath)
+			if err != nil {
+				return []string{}, err
+			}
+
+			if submoduleRemoteTrackingName == submoduleName {
+				list = append(list, submodulePath)
+			}
+		}
+	}
+
+	return list, nil
 }
 
 func cloneRepo(ctx context.Context, repo, branch, rev string, depth int, gitRoot string) error {
@@ -781,6 +979,15 @@ func syncRepo(ctx context.Context, repo, branch, rev string, depth int, gitRoot,
 		}
 		if local == remote {
 			log.V(1).Info("no update required", "rev", rev, "local", local, "remote", remote)
+
+			// update submodules if remote tracking is set
+			if *flSubmodulesRemoteTracking != "" {
+				worktreePath := filepath.Join(gitRoot, "rev-"+local)
+				updateArgs := submoduleUpdateArgs(depth, submoduleMode)
+
+				return false, "", updateSubmodulesWithRemoteTracking(ctx, worktreePath, updateArgs)
+			}
+
 			return false, "", nil
 		}
 		log.V(0).Info("update required", "rev", rev, "local", local, "remote", remote)
