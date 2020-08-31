@@ -823,7 +823,7 @@ func submoduleNameFromPath(ctx context.Context, worktreePath, submodulePath stri
 }
 
 func submoduleBranchRef(ctx context.Context, worktreePath, submoduleName string) (string, error) {
-	confGitModulesArgs := []string{"config", "--file", ".gitmodules", "--get"}
+	confGitModulesArgs := []string{"config", "--file", ".gitmodules", "--default", "", "--get"}
 	confGitModulesArgs = append(confGitModulesArgs, "submodule."+submoduleName+".branch")
 	output, err := runCommand(ctx, worktreePath, *flGitCmd, confGitModulesArgs...)
 	if err != nil {
