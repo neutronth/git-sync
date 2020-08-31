@@ -633,8 +633,7 @@ func addWorktreeAndSwap(ctx context.Context, gitRoot, dest, branch, rev string, 
 	// Update submodules
 	// NOTE: this works for repo with or without submodules.
 	if submoduleMode != submodulesOff {
-		err = updateSubmodules(ctx, worktreePath, depth, submoduleMode)
-		if err != nil {
+		if err := updateSubmodules(ctx, worktreePath, depth, submoduleMode); err != nil {
 			return err
 		}
 	}
@@ -674,8 +673,8 @@ func updateSubmodules(ctx context.Context, worktreePath string, depth int, submo
 
 	updateArgs := submoduleUpdateArgs(depth, submoduleMode)
 	submodulesArgs := append([]string{"submodule", "update", "--init"}, updateArgs...)
-	_, err := runCommand(ctx, worktreePath, *flGitCmd, submodulesArgs...)
-	if err != nil {
+
+	if _, err := runCommand(ctx, worktreePath, *flGitCmd, submodulesArgs...); err != nil {
 		return err
 	}
 
@@ -712,8 +711,8 @@ func updateSubmodulesWithRemoteTracking(ctx context.Context, worktreePath string
 		log.V(0).Info("updating submodule with remote tracking", "submoduleName", submoduleName, "submodulePath", submodulePath)
 		submoduleRemoteUpdateArgs := append([]string{"submodule", "update", "--remote"}, updateArgs...)
 		submoduleRemoteUpdateArgs = append(submoduleRemoteUpdateArgs, submodulePath)
-		_, err = runCommand(ctx, worktreePath, *flGitCmd, submoduleRemoteUpdateArgs...)
-		if err != nil {
+
+		if _, err = runCommand(ctx, worktreePath, *flGitCmd, submoduleRemoteUpdateArgs...); err != nil {
 			return err
 		}
 
@@ -728,8 +727,7 @@ func updateSubmodulesWithRemoteTracking(ctx context.Context, worktreePath string
 	return nil
 }
 
-func submoduleUpdateArgs(depth int, submoduleMode string) []string {
-	args := []string{}
+func submoduleUpdateArgs(depth int, submoduleMode string) (args []string) {
 	if submoduleMode == submodulesRecursive {
 		args = append(args, "--recursive")
 	}
@@ -737,7 +735,7 @@ func submoduleUpdateArgs(depth int, submoduleMode string) []string {
 		args = append(args, "--depth", strconv.Itoa(depth))
 	}
 
-	return args
+	return
 }
 
 func submoduleIsUpToDate(ctx context.Context, worktreePath, submodulePath string) (bool, error) {
