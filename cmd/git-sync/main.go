@@ -58,7 +58,7 @@ var flSubmodules = flag.String("submodules", envString("GIT_SYNC_SUBMODULES", "r
 	"git submodule behavior: one of 'recursive', 'shallow', or 'off'")
 var flSubmodulesRemoteTracking = flag.String("submodules-remote-tracking",
 	envString("GIT_SYNC_SUBMODULES_REMOTE_TRACKING", ""),
-	"Configure submodules list for remote tracking.")
+	"the comma separated submodule's name list to enable remote-tracking branch sync, eg. 'module1,module2', see: 'man gitmodules' and find 'submodule.<name>.branch' for detail")
 
 var flRoot = flag.String("root", envString("GIT_SYNC_ROOT", envString("HOME", "")+"/git"),
 	"the root directory for git-sync operations, under which --dest will be created")
