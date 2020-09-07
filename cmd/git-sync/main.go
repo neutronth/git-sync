@@ -154,6 +154,12 @@ const (
 	submodulesOff       = "off"
 )
 
+type submoduleOptions struct {
+	submoduleMode                  string
+	submoduleRemoteTrackingNames   []string
+	submoduleRemoteTrackingEnabled bool
+}
+
 func init() {
 	prometheus.MustRegister(syncDuration)
 	prometheus.MustRegister(syncCount)
@@ -225,6 +231,26 @@ func setFlagDefaults() {
 	stderrFlag.Value.Set("true")
 }
 
+func parseSubmodulesOptions(submoduleMode, submodulesRemoteTracking string) *submoduleOptions {
+	options := &submoduleOptions{
+		submoduleMode:                  submoduleMode,
+		submoduleRemoteTrackingNames:   []string{},
+		submoduleRemoteTrackingEnabled: false,
+	}
+
+	if submoduleMode == submodulesOff || submodulesRemoteTracking == "" {
+		return options
+	}
+
+	splitFn := func(c rune) bool {
+		return c == ','
+	}
+	options.submoduleRemoteTrackingNames = strings.FieldsFunc(submodulesRemoteTracking, splitFn)
+	options.submoduleRemoteTrackingEnabled = len(options.submoduleRemoteTrackingNames) > 0
+
+	return options
+}
+
 func main() {
 	// In case we come up as pid 1, act as init.
 	if os.Getpid() == 1 {
@@ -260,8 +286,10 @@ func main() {
 		os.Exit(1)
 	}
 
+	var submoduleOpts *submoduleOptions
 	switch *flSubmodules {
 	case submodulesRecursive, submodulesShallow, submodulesOff:
+		submoduleOpts = parseSubmodulesOptions(*flSubmodules, *flSubmodulesRemoteTracking)
 	default:
 		fmt.Fprintf(os.Stderr, "ERROR: --submodules must be one of %q, %q, or %q", submodulesRecursive, submodulesShallow, submodulesOff)
 		flag.Usage()
@@ -449,7 +477,7 @@ func main() {
 	for {
 		start := time.Now()
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second*time.Duration(*flSyncTimeout))
-		if changed, hash, err := syncRepo(ctx, *flRepo, *flBranch, *flRev, *flDepth, *flRoot, *flDest, *flAskPassURL, *flSubmodules); err != nil {
+		if changed, hash, err := syncRepo(ctx, *flRepo, *flBranch, *flRev, *flDepth, *flRoot, *flDest, *flAskPassURL, submoduleOpts); err != nil {
 			updateSyncMetrics(metricKeyError, start)
 			if *flMaxSyncFailures != -1 && failCount >= *flMaxSyncFailures {
 				// Exit after too many retries, maybe the error is not recoverable.
@@ -583,7 +611,7 @@ func setRepoReady() {
 }
 
 // addWorktreeAndSwap creates a new worktree and calls updateSymlink to swap the symlink to point to the new worktree
-func addWorktreeAndSwap(ctx context.Context, gitRoot, dest, branch, rev string, depth int, hash string, submoduleMode string) error {
+func addWorktreeAndSwap(ctx context.Context, gitRoot, dest, branch, rev string, depth int, hash string, submoduleOpts *submoduleOptions) error {
 	log.V(0).Info("syncing git", "rev", rev, "hash", hash)
 
 	args := []string{"fetch", "-f", "--tags"}
@@ -632,8 +660,8 @@ func addWorktreeAndSwap(ctx context.Context, gitRoot, dest, branch, rev string, 
 
 	// Update submodules
 	// NOTE: this works for repo with or without submodules.
-	if submoduleMode != submodulesOff {
-		if err := updateSubmodules(ctx, worktreePath, depth, submoduleMode); err != nil {
+	if submoduleOpts.submoduleMode != submodulesOff {
+		if err := updateSubmodules(ctx, worktreePath, depth, submoduleOpts); err != nil {
 			return err
 		}
 	}
@@ -668,10 +696,10 @@ func addWorktreeAndSwap(ctx context.Context, gitRoot, dest, branch, rev string, 
 	return nil
 }
 
-func updateSubmodules(ctx context.Context, worktreePath string, depth int, submoduleMode string) error {
+func updateSubmodules(ctx context.Context, worktreePath string, depth int, submoduleOpts *submoduleOptions) error {
 	log.V(0).Info("updating submodules")
 
-	updateArgs := submoduleUpdateArgs(depth, submoduleMode)
+	updateArgs := submoduleUpdateArgs(depth, submoduleOpts)
 	submodulesArgs := append([]string{"submodule", "update", "--init"}, updateArgs...)
 
 	if _, err := runCommand(ctx, worktreePath, *flGitCmd, submodulesArgs...); err != nil {
@@ -679,15 +707,15 @@ func updateSubmodules(ctx context.Context, worktreePath string, depth int, submo
 	}
 
 	// Update submodules with remote tracking enabled
-	if *flSubmodulesRemoteTracking != "" {
-		return updateSubmodulesWithRemoteTracking(ctx, worktreePath, updateArgs)
+	if submoduleOpts.submoduleRemoteTrackingEnabled {
+		return updateSubmodulesWithRemoteTracking(ctx, worktreePath, submoduleOpts, updateArgs)
 	}
 
 	return nil
 }
 
-func updateSubmodulesWithRemoteTracking(ctx context.Context, worktreePath string, updateArgs []string) error {
-	submodulePaths, err := getSubmoduleWithRemoteTrackingPaths(ctx, worktreePath)
+func updateSubmodulesWithRemoteTracking(ctx context.Context, worktreePath string, submoduleOpts *submoduleOptions, updateArgs []string) error {
+	submodulePaths, err := getSubmoduleWithRemoteTrackingPaths(ctx, worktreePath, submoduleOpts)
 	if err != nil {
 		return err
 	}
@@ -727,8 +755,8 @@ func updateSubmodulesWithRemoteTracking(ctx context.Context, worktreePath string
 	return nil
 }
 
-func submoduleUpdateArgs(depth int, submoduleMode string) (args []string) {
-	if submoduleMode == submodulesRecursive {
+func submoduleUpdateArgs(depth int, submoduleOpts *submoduleOptions) (args []string) {
+	if submoduleOpts.submoduleMode == submodulesRecursive {
 		args = append(args, "--recursive")
 	}
 	if depth != 0 {
@@ -838,23 +866,22 @@ func submoduleBranchRef(ctx context.Context, worktreePath, submoduleName string)
 	return "HEAD", nil
 }
 
-func getSubmoduleWithRemoteTrackingPaths(ctx context.Context, worktreePath string) ([]string, error) {
+func getSubmoduleWithRemoteTrackingPaths(ctx context.Context, worktreePath string, submoduleOpts *submoduleOptions) ([]string, error) {
 	output, err := runCommand(ctx, worktreePath, *flGitCmd, "submodule", "--quiet", "foreach", "pwd")
 	if err != nil {
 		return []string{}, err
 	}
 
 	splitFn := func(c rune) bool {
-		return c == '\n' || c == ','
+		return c == '\n'
 	}
 
 	trimWorktreePath := strings.ReplaceAll(output, worktreePath+"/", "")
 	submodulePaths := strings.FieldsFunc(trimWorktreePath, splitFn)
-	submoduleRemoteTrackingNames := strings.FieldsFunc(*flSubmodulesRemoteTracking, splitFn)
 
 	list := []string{}
 	for _, submodulePath := range submodulePaths {
-		for _, submoduleRemoteTrackingName := range submoduleRemoteTrackingNames {
+		for _, submoduleRemoteTrackingName := range submoduleOpts.submoduleRemoteTrackingNames {
 			submoduleName, err := submoduleNameFromPath(ctx, worktreePath, submodulePath)
 			if err != nil {
 				return []string{}, err
@@ -941,7 +968,7 @@ func revIsHash(ctx context.Context, rev, gitRoot string) (bool, error) {
 
 // syncRepo syncs the branch of a given repository to the destination at the given rev.
 // returns (1) whether a change occured, (2) the new hash, and (3) an error if one happened
-func syncRepo(ctx context.Context, repo, branch, rev string, depth int, gitRoot, dest string, authURL string, submoduleMode string) (bool, string, error) {
+func syncRepo(ctx context.Context, repo, branch, rev string, depth int, gitRoot, dest string, authURL string, submoduleOpts *submoduleOptions) (bool, string, error) {
 	if authURL != "" {
 		// For ASKPASS Callback URL, the credentials behind is dynamic, it needs to be
 		// re-fetched each time.
@@ -979,11 +1006,11 @@ func syncRepo(ctx context.Context, repo, branch, rev string, depth int, gitRoot,
 			log.V(1).Info("no update required", "rev", rev, "local", local, "remote", remote)
 
 			// update submodules if remote tracking is set
-			if *flSubmodulesRemoteTracking != "" {
+			if submoduleOpts.submoduleRemoteTrackingEnabled {
 				worktreePath := filepath.Join(gitRoot, "rev-"+local)
-				updateArgs := submoduleUpdateArgs(depth, submoduleMode)
+				updateArgs := submoduleUpdateArgs(depth, submoduleOpts)
 
-				return false, "", updateSubmodulesWithRemoteTracking(ctx, worktreePath, updateArgs)
+				return false, "", updateSubmodulesWithRemoteTracking(ctx, worktreePath, submoduleOpts, updateArgs)
 			}
 
 			return false, "", nil
@@ -992,7 +1019,7 @@ func syncRepo(ctx context.Context, repo, branch, rev string, depth int, gitRoot,
 		hash = remote
 	}
 
-	return true, hash, addWorktreeAndSwap(ctx, gitRoot, dest, branch, rev, depth, hash, submoduleMode)
+	return true, hash, addWorktreeAndSwap(ctx, gitRoot, dest, branch, rev, depth, hash, submoduleOpts)
 }
 
 // getRevs returns the local and upstream hashes for rev.
