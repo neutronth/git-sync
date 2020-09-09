@@ -55,6 +55,9 @@ var flDepth = flag.Int("depth", envInt("GIT_SYNC_DEPTH", 0),
 	"use a shallow clone with a history truncated to the specified number of commits")
 var flSubmodules = flag.String("submodules", envString("GIT_SYNC_SUBMODULES", "recursive"),
 	"git submodule behavior: one of 'recursive', 'shallow', or 'off'")
+var flSubmodulesRemoteTracking = flag.String("submodules-remote-tracking",
+	envString("GIT_SYNC_SUBMODULES_REMOTE_TRACKING", ""),
+	"the comma separated submodule's name list to enable remote-tracking branch sync, eg. 'module1,module2', see: 'man gitmodules' and find 'submodule.<name>.branch' for detail")
 
 var flRoot = flag.String("root", envString("GIT_SYNC_ROOT", ""),
 	"the root directory for git-sync operations, under which --leaf will be created")
@@ -504,6 +507,21 @@ func main() {
 		authURL:    *flAskPassURL,
 	}
 
+	// Startup submodules remote-tracking goroutine
+	var submodulesRemoteTracking *SubmodulesRemoteTracking
+	if *flSubmodulesRemoteTracking != "" {
+		submodulesRemoteTracking = &SubmodulesRemoteTracking{
+			Cmd:                      *flGitCmd,
+			RootDir:                  absRoot,
+			Depth:                    *flDepth,
+			Submodules:               *flSubmodules,
+			SubmodulesRemoteTracking: *flSubmodulesRemoteTracking,
+			Period:                   *flPeriod,
+			State:                    NewSubmodulesRemoteTrackingState(),
+		}
+		go submodulesRemoteTracking.run()
+	}
+
 	failCount := 0
 	curSHA := "(unknown)"
 	for initialSync := true; true; initialSync = false {
@@ -545,6 +563,10 @@ func main() {
 
 		if webhook != nil {
 			webhook.Send(newSHA)
+		}
+
+		if submodulesRemoteTracking != nil {
+			submodulesRemoteTracking.UpdateState(newSHA)
 		}
 
 		if initialSync && *flOneTime {
