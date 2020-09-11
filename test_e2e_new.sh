@@ -132,7 +132,6 @@ function finish() {
   fi
   trap "" INT EXIT
   remove_containers
-  exit 1
 }
 trap finish INT EXIT
 
